@@ -1,9 +1,9 @@
 """Application settings and configurable LLM provider."""
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Ignorar variables de entorno vacías (p. ej. GROQ_API_KEY="" en la
+        # sesión): sin esto, el valor vacío pisa la clave real del archivo .env.
+        env_ignore_empty=True,
     )
 
     groq_api_key: SecretStr | None = None
@@ -27,6 +30,19 @@ class Settings(BaseSettings):
         default="sentence-transformers/all-MiniLM-L6-v2",
         alias="ADA_EMBEDDING_MODEL",
     )
+
+    @field_validator("groq_api_key", mode="before")
+    @classmethod
+    def _empty_key_becomes_none(cls, value: Any) -> Any:
+        """Tratar una clave vacía (p. ej. variable de entorno sin valor) como ausente.
+
+        Las variables de entorno tienen prioridad sobre el archivo .env en
+        pydantic-settings; una GROQ_API_KEY vacía en la sesión pisa la clave
+        real del archivo. Normalizamos: cadena vacía o solo espacios -> None.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @lru_cache

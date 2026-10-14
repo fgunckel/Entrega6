@@ -13,7 +13,7 @@ from collections.abc import Callable
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
-from ada.agents.analyst import build_analysis
+from ada.agents.analyst import build_analysis, derive_scores_from_evidence
 from ada.agents.researcher import retrieve_evidence
 from ada.agents.supervisor import route_next_agent
 from ada.config import get_settings
@@ -57,24 +57,38 @@ def make_supervisor_node(chat_model) -> Worker:
 
 
 def make_researcher_node(encoder=None, documents=None) -> Worker:
-    """Create the researcher node. Owns only `research_artifact`."""
+    """Create the researcher node. Owns only `research_artifact`.
+
+    If `validation_errors` are pending, this is a repair round: the node
+    regenerates its own artifact (replacing the invalid previous version)
+    and clears the pending errors from state.
+    """
 
     def researcher_node(state: dict) -> dict:
-
+        pending_errors = state.get("validation_errors") or []
         artifact = retrieve_evidence(
             query=state.get("user_request", ""),
             encoder=encoder,
             documents=documents,
         )
+        summary = f"{len(artifact.evidence)} evidencias recuperadas."
+        if pending_errors:
+            summary = f"Reintento tras validación: {summary}"
         return {
             "research_artifact": artifact.model_dump(),
+            "validation_errors": [],
+            # Invalidación de validación previa: el artefacto cambió, así que
+            # una validación anterior aprobada ya no autoriza la síntesis.
+            "validation_result": None,
             "contributions": [
                 *state.get("contributions", []),
                 {
                     "agent": "researcher",
                     "artifact_type": "research",
-                    "summary": f"{len(artifact.evidence)} evidencias recuperadas.",
+                    "summary": summary,
                     "step": state.get("steps", 0),
+                    "attempt": state.get("retries", 0),
+                    "errors": pending_errors,
                 },
             ],
         }
@@ -96,110 +110,14 @@ def _default_alternatives() -> list[dict]:
     return [dict(item) for item in DEFAULT_ALTERNATIVES]
 
 
-def _default_scores() -> dict[str, list[dict]]:
-    """Return neutral baseline scores per alternative (deterministic)."""
-    return {
-        "monolith": [
-            {
-                "criterion_id": "dev-speed",
-                "weight": 0.25,
-                "score": 4,
-                "rationale": "Base sólida para iterar rápido.",
-            },
-            {
-                "criterion_id": "operational-cost",
-                "weight": 0.25,
-                "score": 5,
-                "rationale": "Un solo despliegue.",
-            },
-            {
-                "criterion_id": "independent-deploys",
-                "weight": 0.15,
-                "score": 1,
-                "rationale": "Despliegue unitario acoplado.",
-            },
-            {
-                "criterion_id": "scalability",
-                "weight": 0.15,
-                "score": 2,
-                "rationale": "Escalado global únicamente.",
-            },
-            {
-                "criterion_id": "team-alignment",
-                "weight": 0.20,
-                "score": 4,
-                "rationale": "Simple para equipos pequeños.",
-            },
-        ],
-        "modular-monolith": [
-            {
-                "criterion_id": "dev-speed",
-                "weight": 0.25,
-                "score": 4,
-                "rationale": "Módulos con límites claros.",
-            },
-            {
-                "criterion_id": "operational-cost",
-                "weight": 0.25,
-                "score": 4,
-                "rationale": "Despliegue unitario simple.",
-            },
-            {
-                "criterion_id": "independent-deploys",
-                "weight": 0.15,
-                "score": 2,
-                "rationale": "Despliegue acoplado pero módulos aislables.",
-            },
-            {
-                "criterion_id": "scalability",
-                "weight": 0.15,
-                "score": 3,
-                "rationale": "Escalado global con módulos extraíbles.",
-            },
-            {
-                "criterion_id": "team-alignment",
-                "weight": 0.20,
-                "score": 4,
-                "rationale": "Buen ajuste para equipos pequeños/medianos.",
-            },
-        ],
-        "microservices": [
-            {
-                "criterion_id": "dev-speed",
-                "weight": 0.25,
-                "score": 2,
-                "rationale": "Mayor sobrecarga de coordinación.",
-            },
-            {
-                "criterion_id": "operational-cost",
-                "weight": 0.25,
-                "score": 2,
-                "rationale": "Requiere plataforma distribuida.",
-            },
-            {
-                "criterion_id": "independent-deploys",
-                "weight": 0.15,
-                "score": 5,
-                "rationale": "Despliegue independiente por servicio.",
-            },
-            {
-                "criterion_id": "scalability",
-                "weight": 0.15,
-                "score": 5,
-                "rationale": "Escalado selectivo por servicio.",
-            },
-            {
-                "criterion_id": "team-alignment",
-                "weight": 0.20,
-                "score": 3,
-                "rationale": "Adecuado solo con muchos equipos.",
-            },
-        ],
-    }
-
-
 def analyst_node(state: dict) -> dict:
-    """Analyst node. Owns only `analysis_artifact`."""
+    """Analyst node. Owns only `analysis_artifact`.
+
+    If `validation_errors` are pending, this is a repair round: the node
+    regenerates its own artifact (replacing the invalid previous version)
+    and clears the pending errors from state.
+    """
+    pending_errors = state.get("validation_errors") or []
     criteria = [Criterion.model_validate(item) for item in state.get("criteria", [])]
     if not criteria:
         criteria = _default_criteria()
@@ -208,50 +126,89 @@ def analyst_node(state: dict) -> dict:
     if not alternatives:
         alternatives = _default_alternatives()
 
-    proposed = _default_scores()
+    research = state.get("research_artifact") or {}
+    proposed = derive_scores_from_evidence(
+        user_request=state.get("user_request", ""),
+        system_profile=state.get("system_profile", {}) or {},
+        criteria=criteria,
+        alternatives=alternatives,
+        research_artifact=research,
+    )
 
     artifact = build_analysis(criteria, alternatives, proposed)
 
+    summary = f"Ranking: {' > '.join(artifact.ranking)}."
+    if pending_errors:
+        summary = f"Reintento tras validación: {summary}"
+
     return {
         "analysis_artifact": artifact.model_dump(),
+        "validation_errors": [],
+        # Invalidación de validación previa: el artefacto cambió, así que
+        # una validación anterior aprobada ya no autoriza la síntesis.
+        "validation_result": None,
         "contributions": [
             *state.get("contributions", []),
             {
                 "agent": "analyst",
                 "artifact_type": "analysis",
-                "summary": f"Ranking: {' > '.join(artifact.ranking)}.",
+                "summary": summary,
                 "step": state.get("steps", 0),
+                "attempt": state.get("retries", 0),
+                "errors": pending_errors,
             },
         ],
     }
 
 
 def validator_node(state: dict) -> dict:
-    """Deterministic validator node. Owns only `validation_result`."""
+    """Deterministic validator node. Owns only `validation_result`.
+
+    Validations are deterministic: schema contracts, evidence references,
+    scoring coherence. Errors are classified by the specialist responsible
+    for fixing them (researcher or analyst).
+    """
     errors: list[str] = []
     warnings: list[str] = []
+    research_errors: list[str] = []
+    analysis_errors: list[str] = []
 
     research = state.get("research_artifact")
     analysis = state.get("analysis_artifact")
 
     if not research:
-        errors.append("Missing research artifact; cannot validate without evidence.")
+        error = "Missing research artifact; cannot validate without evidence."
+        errors.append(error)
+        research_errors.append(error)
     if not analysis:
-        errors.append("Missing analysis artifact; cannot validate without comparison.")
-
-    missing_evidence_ids: list[str] = []
+        error = "Missing analysis artifact; cannot validate without comparison."
+        errors.append(error)
+        analysis_errors.append(error)
 
     criteria = [Criterion.model_validate(item) for item in state.get("criteria", [])]
     if not criteria:
         criteria = _default_criteria()
 
     if research and analysis:
+        # Validación por separado: cada error de esquema queda asociado al
+        # artefacto que falló, no arbitrariamente al Researcher.
+        research_artifact = None
+        analysis_artifact = None
         try:
             research_artifact = ResearchArtifact.model_validate(research)
+        except ValidationError as error:
+            error_message = f"Research artifact contract violation: {error}"
+            errors.append(error_message)
+            research_errors.append(error_message)
+
+        try:
             analysis_artifact = AnalysisArtifact.model_validate(analysis)
         except ValidationError as error:
-            errors.append(f"Artifact contract violation: {error}")
-        else:
+            error_message = f"Analysis artifact contract violation: {error}"
+            errors.append(error_message)
+            analysis_errors.append(error_message)
+
+        if research_artifact and analysis_artifact:
             evidence_ids = {item.document_id for item in research_artifact.evidence}
             cited_ids = {
                 evidence_id
@@ -261,43 +218,63 @@ def validator_node(state: dict) -> dict:
             }
             missing = sorted(cited_ids - evidence_ids)
             if missing:
-                errors.append(
-                    f"Analysis cites unknown evidence IDs: {', '.join(missing)}."
-                )
+                error = f"Analysis cites unknown evidence IDs: {', '.join(missing)}."
+                errors.append(error)
+                analysis_errors.append(error)
 
             for alternative in analysis_artifact.alternatives:
                 try:
                     recalc = calculate_weighted_score(alternative.scores, criteria)
                 except ValueError as error:
-                    errors.append(
+                    message = (
                         f"Scoring error for '{alternative.alternative_id}': {error}"
                     )
+                    errors.append(message)
+                    analysis_errors.append(message)
                 else:
                     if abs(alternative.weighted_score - recalc) > 1e-6:
-                        errors.append(
+                        error = (
                             f"Weighted score mismatch for '{alternative.alternative_id}': "
                             f"reported {alternative.weighted_score}, calculated {recalc}."
                         )
+                        errors.append(error)
+                        analysis_errors.append(error)
 
             if not research_artifact.evidence:
+                # Evidencia obligatoria: sin evidencia trazable no hay informe
+                # válido. Error bloqueante en la lista principal, no un warning.
+                error = (
+                    "Research artifact contains no evidence; retrieve evidence "
+                    "before analysis."
+                )
+                errors.append(error)
+                research_errors.append(error)
                 warnings.append(
-                    "Research artifact contains no evidence; "
-                    "analysis relies on assumptions."
+                    "Analysis relies on assumptions: no evidence was retrieved."
                 )
 
     is_valid = not errors
     settings = get_settings()
+    retries = state.get("retries", 0)
+    fixable = not is_valid and retries < settings.max_retries and bool(
+        research_errors or analysis_errors
+    )
     result = ValidationResult(
         is_valid=is_valid,
         errors=errors,
         warnings=warnings,
-        missing_evidence_ids=missing_evidence_ids,
         requires_human_review=(
-            not is_valid and state.get("retries", 0) >= settings.max_retries
+            not is_valid and (
+                state.get("retries", 0) + 1 >= settings.max_retries
+                if fixable
+                else state.get("retries", 0) >= settings.max_retries
+            )
         ),
+        research_errors=research_errors,
+        analysis_errors=analysis_errors,
     )
 
-    return {
+    update: dict = {
         "validation_result": result.model_dump(),
         "contributions": [
             *state.get("contributions", []),
@@ -306,9 +283,30 @@ def validator_node(state: dict) -> dict:
                 "artifact_type": "validation",
                 "summary": "Valid" if is_valid else f"{len(errors)} errores de validación.",
                 "step": state.get("steps", 0),
+                "decision": "valid" if is_valid else "invalid",
+                "reason": (
+                    "Artefactos consistentes." if is_valid
+                    else "Errores de validación detectados."
+                ),
+                "attempt": retries,
+                "errors": errors,
             },
         ],
     }
+
+    if not is_valid and fixable:
+        # Incremento explícito y determinístico del contador de reintentos.
+        # Los errores específicos se entregan al especialista responsable.
+        repair_errors = list(research_errors or analysis_errors)
+        result_dict = result.model_dump()
+        result_dict["pending_repair_agent"] = (
+            "researcher" if research_errors else "analyst"
+        )
+        update["validation_result"] = result_dict
+        update["retries"] = retries + 1
+        update["validation_errors"] = repair_errors
+
+    return update
 
 
 def synthesizer_node(state: dict) -> dict:
@@ -391,8 +389,61 @@ def synthesizer_node(state: dict) -> dict:
 
 
 def route_after_supervisor(state: dict) -> str:
-    """Conditional edge: route to the agent chosen by the supervisor."""
-    return state["next_agent"]
+    """Conditional edge with deterministic synthesis protection.
+
+    The supervisor (LLM) proposes a route, but this edge enforces the
+    deterministic rule: `synthesizer` may only run with an explicit,
+    current validation whose `is_valid` is True. If the supervisor picks
+    `synthesizer` (or `END`) without an approved, current validation, the
+    workflow is routed to the validator instead of the requested node.
+    """
+    proposed = state["next_agent"]
+    validation = state.get("validation_result") or {}
+    approved = bool(validation.get("is_valid"))
+
+    if proposed == "synthesizer" and not approved:
+        # Protección determinística: no se llama al Synthesizer sin
+        # validación vigente aprobada; se completa la validación primero.
+        return "validator"
+
+    if proposed == "END":
+        report = state.get("final_report") or {}
+        if report.get("status") == "complete":
+            return END
+        # END sin informe exitoso vigente no se presenta como éxito.
+        return "validator" if state.get("research_artifact") else "limited_finish"
+
+    return proposed
+
+
+def route_after_validator(state: dict) -> str:
+    """Deterministic conditional edge after the validator.
+
+    - All required artifacts valid -> synthesizer.
+    - Fixable errors with retries remaining -> the specialist responsible
+      for the affected artifact (it receives the specific errors in state).
+    - Retries exhausted or unclassified errors -> limited_finish (safe
+      output; human review pending). Never synthesizes an invalid result.
+    """
+    validation = state.get("validation_result") or {}
+    if validation.get("is_valid"):
+        return "synthesizer"
+
+    settings = get_settings()
+    if state.get("retries", 0) >= settings.max_retries:
+        return "limited_finish"
+
+    if validation.get("research_errors"):
+        return "researcher"
+    if validation.get("analysis_errors"):
+        return "analyst"
+
+    return "limited_finish"
+
+
+def make_validator_router() -> Callable[[dict], str]:
+    """Return the conditional-edge function used after the validator."""
+    return route_after_validator
 
 
 def build_graph(chat_model, encoder=None, documents=None) -> StateGraph:
@@ -420,9 +471,21 @@ def build_graph(chat_model, encoder=None, documents=None) -> StateGraph:
         },
     )
 
-    # Workers return to the supervisor for the next routing decision.
-    for worker in ("researcher", "analyst", "validator"):
+    # Workers return to the supervisor for the next routing decision,
+    # except the validator: its outcome decides deterministically.
+    for worker in ("researcher", "analyst"):
         graph.add_edge(worker, "supervisor")
+
+    graph.add_conditional_edges(
+        "validator",
+        route_after_validator,
+        {
+            "synthesizer": "synthesizer",
+            "researcher": "researcher",
+            "analyst": "analyst",
+            "limited_finish": "limited_finish",
+        },
+    )
 
     graph.add_edge("synthesizer", END)
     graph.add_edge("limited_finish", END)

@@ -80,6 +80,9 @@ class ValidationResult(StrictModel):
     warnings: list[str] = Field(default_factory=list)
     missing_evidence_ids: list[str] = Field(default_factory=list)
     requires_human_review: bool = False
+    # Errores clasificados por el especialista responsable de corregirlos.
+    research_errors: list[str] = Field(default_factory=list)
+    analysis_errors: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_result_has_no_errors(self):

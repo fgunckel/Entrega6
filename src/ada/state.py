@@ -23,6 +23,10 @@ class AgentContribution(TypedDict):
     artifact_type: str
     summary: str
     step: int
+    decision: NotRequired[str]
+    reason: NotRequired[str]
+    attempt: NotRequired[int]
+    errors: NotRequired[list[str]]
 
 
 class AgentState(MessagesState):
@@ -34,6 +38,9 @@ class AgentState(MessagesState):
     analysis_artifact: NotRequired[dict | None]
     validation_result: NotRequired[dict | None]
     contributions: NotRequired[list[AgentContribution]]
+    # Errores de validación pendientes, dirigidos al especialista responsable
+    # para que corrija su propio artefacto. Se limpian al regenerar.
+    validation_errors: NotRequired[list[str]]
 
     next_agent: AgentName
     routing_reason: str

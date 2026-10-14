@@ -1,8 +1,9 @@
 """Analyst agent: compare architecture alternatives with weighted criteria.
 
 The analyst owns only the `analysis_artifact` field of shared state.
-The LLM may propose per-criterion scores and rationales, but Python
-validates the schema and computes all totals deterministically.
+Scores are derived from the use case (user request, system profile) and
+the evidence retrieved by the researcher; Python validates the schema
+and computes all totals deterministically.
 """
 
 from ada.schemas import (
@@ -51,6 +52,175 @@ DEFAULT_CRITERIA = [
         "description": "Ajuste entre límites de arquitectura y estructura del equipo.",
     },
 ]
+
+# Señales por criterio: frases del caso de uso que empujan el puntaje del
+# criterio hacia arriba o hacia abajo. Se buscan en la solicitud del
+# usuario, el perfil del sistema y la evidencia recuperada.
+CRITERIA_SIGNALS: dict[str, dict[str, list[str]]] = {
+    "dev-speed": {
+        "positive": ["entregar rápido", "presión", "plazo", "time to market", "mvp"],
+        "negative": ["sin apuro", "plazo flexible"],
+    },
+    "operational-cost": {
+        "negative": ["equipo de plataformas", "observabilidad", "alta escala"],
+        "positive": ["equipo pequeño", "operación simple"],
+    },
+    "independent-deploys": {
+        "positive": ["despliegues independientes", "release frecuente", "varios equipos"],
+        "negative": ["no se requieren despliegues independientes"],
+    },
+    "scalability": {
+        "positive": ["escalar", "alta demanda", "crecimiento", "picos"],
+        "negative": ["carga predecible", "baja concurrencia"],
+    },
+    "team-alignment": {
+        "positive": ["equipo pequeño", "un solo equipo"],
+        "negative": ["muchos equipos", "organización grande"],
+    },
+}
+
+# Señales por alternativa: si aparecen en la evidencia recuperada, la
+# alternativa recibe un empujón semántico en sus puntajes.
+ALTERNATIVE_SIGNALS: dict[str, list[str]] = {
+    "monolith": ["monolito", "monolith", "aplicación única"],
+    "modular-monolith": ["monolito modular", "modular monolith", "módulos"],
+    "microservices": ["microservicios", "microservices", "servicios independientes"],
+}
+
+
+def system_profile_text(system_profile: dict) -> str:
+    """Flatten the system profile into a single text for signal matching."""
+    return " ".join(
+        str(value) for value in system_profile.values() if isinstance(value, (str, list))
+    )
+
+
+def _count_signals(text: str, phrases: list[str]) -> int:
+    """Count how many signal phrases appear in the given text."""
+    normalized = text.lower()
+    return sum(1 for phrase in phrases if phrase in normalized)
+
+
+def _evidence_text(research_artifact: dict) -> str:
+    """Concatenate the evidence excerpts into a single lowercase text."""
+    evidence = research_artifact.get("evidence", []) if research_artifact else []
+    return " ".join(
+        f"{item.get('title', '')} {item.get('excerpt', '')}".lower()
+        for item in evidence
+    )
+
+
+def derive_scores_from_evidence(
+    user_request: str,
+    system_profile: dict,
+    criteria: list[Criterion],
+    alternatives: list[dict],
+    research_artifact: dict,
+) -> dict[str, list[dict]]:
+    """Derive per-criterion scores from the use case and the evidence.
+
+    Deterministic keyword-signal scoring:
+    - Signals found in the user request / system profile push each
+      criterion score up or down.
+    - Evidence excerpts matching alternative keywords push that
+      alternative's scores up (semantic support from the corpus).
+    - Criteria with no evidence backing are marked `is_assumption=True`
+      and the uncertainty is reported in the artifact's data gaps.
+    """
+    request_text = f"{user_request} {system_profile_text(system_profile)}".lower()
+    evidence_text = _evidence_text(research_artifact)
+    has_evidence = bool(research_artifact.get("evidence"))
+
+    scores_by_alternative: dict[str, list[dict]] = {}
+
+    for alternative in alternatives:
+        alternative_id = alternative["alternative_id"]
+        alternative_text = " ".join(
+            str(value) for value in alternative.values() if isinstance(value, str)
+        ).lower()
+        scores: list[dict] = []
+
+        for criterion in criteria:
+            signals = CRITERIA_SIGNALS.get(criterion.criterion_id, {})
+            positive_hits = _count_signals(
+                f"{request_text} {alternative_text}", signals.get("positive", [])
+            )
+            negative_hits = _count_signals(
+                f"{request_text} {alternative_text}", signals.get("negative", [])
+            )
+
+            # Neutral baseline: 3. Signals push within the 1..5 range.
+            score = 3 + positive_hits - negative_hits
+            score = min(max(score, 1), 5)
+
+            # Corpus support: evidence mentioning this alternative's
+            # keywords nudges the score up by one (bounded).
+            if evidence_text and any(
+                signal in evidence_text
+                for signal in ALTERNATIVE_SIGNALS.get(alternative_id, [])
+            ):
+                score = min(score + 1, 5)
+
+            rationale = _build_rationale(
+                criterion=criterion,
+                score=score,
+                positive_hits=positive_hits,
+                negative_hits=negative_hits,
+                has_evidence=has_evidence,
+            )
+
+            scores.append(
+                {
+                    "criterion_id": criterion.criterion_id,
+                    "weight": criterion.weight,
+                    "score": score,
+                    "rationale": rationale,
+                    "evidence_ids": _matching_evidence_ids(
+                        research_artifact, ALTERNATIVE_SIGNALS.get(alternative_id, [])
+                    ),
+                    "is_assumption": not has_evidence,
+                }
+            )
+
+        scores_by_alternative[alternative_id] = scores
+
+    return scores_by_alternative
+
+
+def _count_signals(text: str, signals: list[str]) -> int:
+    """Count how many signal phrases appear in the text."""
+    return sum(1 for signal in signals if signal in text)
+
+
+def _build_rationale(
+    positive_hits: int,
+    negative_hits: int,
+    score: int,
+    criterion: Criterion,
+    has_evidence: bool,
+) -> str:
+    """Build a deterministic rationale for a criterion score."""
+    parts = [f"Puntaje {score}/5 para '{criterion.name}'."]
+    if positive_hits:
+        parts.append(f"Señales a favor del caso: {positive_hits}.")
+    if negative_hits:
+        parts.append(f"Señales en contra del caso: {negative_hits}.")
+    if has_evidence:
+        parts.append("Apoyado en evidencia del corpus local.")
+    else:
+        parts.append("Sin evidencia directa: estimación sujeta a revisión.")
+    return " ".join(parts)
+
+
+def _matching_evidence_ids(research_artifact: dict, signals: list[str]) -> list[str]:
+    """Return evidence IDs whose excerpt matches any signal."""
+    evidence = research_artifact.get("evidence", []) or []
+    matched = []
+    for item in evidence:
+        text = f"{item.get('title', '')} {item.get('excerpt', '')}".lower()
+        if any(signal in text for signal in signals):
+            matched.append(item.get("document_id", ""))
+    return sorted({doc_id for doc_id in matched if doc_id})
 
 
 def build_analysis(

@@ -77,6 +77,30 @@ CRITERIA_SIGNALS: dict[str, dict[str, list[str]]] = {
         "positive": ["equipo pequeño", "un solo equipo"],
         "negative": ["muchos equipos", "organización grande"],
     },
+    "coupling": {
+        "positive": [
+            "acoplamiento bajo",
+            "desacoplar",
+            "desacoplado",
+            "mensajería",
+            "mensajería asincrónica",
+        ],
+        "negative": ["acoplamiento fuerte", "llamadas directas", "acoplamiento"],
+    },
+    "resilience": {
+        "positive": [
+            "resiliencia",
+            "tolerancia a fallos",
+            "reintentos",
+            "circuit breaker",
+            "desacoplar",
+        ],
+        "negative": ["punto único de falla", "acoplamiento fuerte"],
+    },
+    "latency": {
+        "positive": ["latencia baja", "respuesta inmediata", "baja latencia"],
+        "negative": ["latencia", "espera", "bloqueante"],
+    },
 }
 
 # Señales por alternativa: si aparecen en la evidencia recuperada, la
@@ -85,6 +109,8 @@ ALTERNATIVE_SIGNALS: dict[str, list[str]] = {
     "monolith": ["monolito", "monolith", "aplicación única"],
     "modular-monolith": ["monolito modular", "modular monolith", "módulos"],
     "microservices": ["microservicios", "microservices", "servicios independientes"],
+    "azure-service-bus": ["service bus", "mensajería", "cola de mensajes", "asincrónica"],
+    "sync-http": ["http", "llamada directa", "síncrona", "sincrona"],
 }
 
 
@@ -101,13 +127,37 @@ def _count_signals(text: str, phrases: list[str]) -> int:
     return sum(1 for phrase in phrases if phrase in normalized)
 
 
-def _evidence_text(research_artifact: dict) -> str:
-    """Concatenate the evidence excerpts into a single lowercase text."""
-    evidence = research_artifact.get("evidence", []) if research_artifact else []
-    return " ".join(
-        f"{item.get('title', '')} {item.get('excerpt', '')}".lower()
-        for item in evidence
-    )
+def _criterion_terms(criterion: Criterion) -> list[str]:
+    """Señales (positivas y negativas) y nombre de un criterio."""
+    signals = CRITERIA_SIGNALS.get(criterion.criterion_id, {})
+    phrases = list(signals.get("positive", [])) + list(signals.get("negative", []))
+    return [criterion.name.lower(), *phrases]
+
+
+def _pertinent_evidence_ids(
+    research_artifact: dict,
+    alternative_id: str,
+    criterion: Criterion,
+) -> list[str]:
+    """Evidencia relacionada con la alternativa Y el criterio evaluado.
+
+    Una evidencia es pertinente para una puntuación solo si menciona
+    señales de la alternativa (p. ej. "service bus") y además términos
+    relacionados con el criterio evaluado (sus señales o su nombre).
+    """
+    evidence = research_artifact.get("evidence", []) or []
+    alternative_signals = ALTERNATIVE_SIGNALS.get(alternative_id, [])
+    if not alternative_signals:
+        return []
+    criterion_phrases = _criterion_terms(criterion)
+    matched = []
+    for item in evidence:
+        text = f"{item.get('title', '')} {item.get('excerpt', '')}".lower()
+        mentions_alternative = any(signal in text for signal in alternative_signals)
+        mentions_criterion = any(phrase in text for phrase in criterion_phrases)
+        if mentions_alternative and mentions_criterion:
+            matched.append(item.get("document_id", ""))
+    return sorted({doc_id for doc_id in matched if doc_id})
 
 
 def derive_scores_from_evidence(
@@ -128,8 +178,6 @@ def derive_scores_from_evidence(
       and the uncertainty is reported in the artifact's data gaps.
     """
     request_text = f"{user_request} {system_profile_text(system_profile)}".lower()
-    evidence_text = _evidence_text(research_artifact)
-    has_evidence = bool(research_artifact.get("evidence"))
 
     scores_by_alternative: dict[str, list[dict]] = {}
 
@@ -153,12 +201,16 @@ def derive_scores_from_evidence(
             score = 3 + positive_hits - negative_hits
             score = min(max(score, 1), 5)
 
-            # Corpus support: evidence mentioning this alternative's
-            # keywords nudges the score up by one (bounded).
-            if evidence_text and any(
-                signal in evidence_text
-                for signal in ALTERNATIVE_SIGNALS.get(alternative_id, [])
-            ):
+            # Respaldo por puntuación: solo la evidencia realmente
+            # relacionada con la alternativa Y el criterio cuenta como
+            # soporte trazable.
+            pertinent_ids = _pertinent_evidence_ids(
+                research_artifact, alternative_id, criterion
+            )
+
+            # Corpus support: evidence pertinent to this alternative AND
+            # criterion nudges the score up by one (bounded).
+            if pertinent_ids:
                 score = min(score + 1, 5)
 
             rationale = _build_rationale(
@@ -166,7 +218,7 @@ def derive_scores_from_evidence(
                 score=score,
                 positive_hits=positive_hits,
                 negative_hits=negative_hits,
-                has_evidence=has_evidence,
+                has_evidence=bool(pertinent_ids),
             )
 
             scores.append(
@@ -175,10 +227,8 @@ def derive_scores_from_evidence(
                     "weight": criterion.weight,
                     "score": score,
                     "rationale": rationale,
-                    "evidence_ids": _matching_evidence_ids(
-                        research_artifact, ALTERNATIVE_SIGNALS.get(alternative_id, [])
-                    ),
-                    "is_assumption": not has_evidence,
+                    "evidence_ids": pertinent_ids,
+                    "is_assumption": not pertinent_ids,
                 }
             )
 
@@ -210,17 +260,6 @@ def _build_rationale(
     else:
         parts.append("Sin evidencia directa: estimación sujeta a revisión.")
     return " ".join(parts)
-
-
-def _matching_evidence_ids(research_artifact: dict, signals: list[str]) -> list[str]:
-    """Return evidence IDs whose excerpt matches any signal."""
-    evidence = research_artifact.get("evidence", []) or []
-    matched = []
-    for item in evidence:
-        text = f"{item.get('title', '')} {item.get('excerpt', '')}".lower()
-        if any(signal in text for signal in signals):
-            matched.append(item.get("document_id", ""))
-    return sorted({doc_id for doc_id in matched if doc_id})
 
 
 def build_analysis(
@@ -270,14 +309,36 @@ def build_analysis(
 
     best_id = ranking[0]
     best = next(a for a in analyses if a.alternative_id == best_id)
-    summary = (
-        f"'{best.name}' obtiene el mayor puntaje ponderado ({best.weighted_score:.3f}) "
-        f"sobre {len(analyses)} alternativas evaluadas con {len(criteria)} criterios ponderados."
-    )
+    # Empates honestos: si el top comparte puntaje, se declara empate.
+    tied = [
+        a.name
+        for a in analyses
+        if abs(a.weighted_score - best.weighted_score) <= 1e-6
+    ]
+    if len(tied) > 1:
+        summary = (
+            f"Empate entre {len(tied)} alternativas con puntaje ponderado "
+            f"{best.weighted_score:.6f}: {', '.join(tied)}. El ranking refleja "
+            f"el orden de presentación, no una diferencia real."
+        )
+    else:
+        summary = (
+            f"'{best.name}' obtiene el mayor puntaje ponderado "
+            f"({best.weighted_score:.3f}) sobre {len(analyses)} alternativas "
+            f"evaluadas con {len(criteria)} criterios ponderados."
+        )
+
+    data_gaps = [
+        f"Criterio '{score.criterion_id}' sin evidencia directa: "
+        "estimación sujeta a revisión."
+        for alternative in analyses
+        for score in alternative.scores
+        if score.is_assumption
+    ]
 
     return AnalysisArtifact(
         alternatives=analyses,
         ranking=ranking,
-        data_gaps=[],
+        data_gaps=data_gaps,
         qualitative_summary=summary,
     )

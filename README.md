@@ -26,6 +26,10 @@ flowchart TD
     HITL2 --> END
 ```
 
+### Por qué esta topología
+
+Se eligió un **supervisor centralizado** frente a alternativas como la colaboración entre pares o el enrutamiento por cadena fija, porque el flujo de decisión tiene una secuencia natural (evidencia → análisis → validación → informe) que conviene dirigir desde un único punto con salida estructurada. Esto permite: (1) imponer los límites globales (pasos y reintentos) en Python, no por decisión del LLM; (2) verificar de forma determinística las reglas críticas (el Synthesizer solo corre con validación vigente aprobada, y `END` solo declara éxito con informe completo vigente); y (3) mantener a cada especialista dueño de sus propios campos, sin contaminación de contexto. Los conflictos entre agentes no se negocian entre pares: los arbitra el Validator, que clasifica cada error por el especialista responsable y acota las rondas de reparación.
+
 ### Responsabilidad de cada nodo
 
 - **Supervisor**: coordina y enruta dinámicamente entre especialistas con salida estructurada (`RoutingDecision`) validada con Pydantic. No investiga ni calcula puntajes. Impone límites globales de pasos (8). Ante fallo del modelo, enruta a `limited_finish` de forma segura.
@@ -42,6 +46,16 @@ flowchart TD
 4. El especialista regenera su propio artefacto (reemplazando la versión inválida) y limpia los errores pendientes.
 5. Si todos los artefactos son válidos, el Synthesizer produce el informe final.
 6. Si se agotan los intentos, el flujo termina con `limited_finish` (resultado seguro, revisión humana pendiente). Nunca sintetiza un informe exitoso con artefactos inválidos.
+
+## Invalidación de validaciones e informes obsoletos
+
+Los resultados previos caducan cuando cambia la evidencia en la que se basan:
+
+- Cada vez que Researcher o Analyst actualiza su artefacto (flujo normal o ronda de reparación), invalida explícitamente la validación previa **y** el informe final previo (`validation_result = None`, `final_report = None`).
+- El Synthesizer solo se ejecuta con una validación vigente aprobada; el enrutamiento post-Supervisor lo verifica de forma determinística: si el Supervisor propone `synthesizer` sin validación vigente aprobada, el grafo enruta al Validator.
+- `END` solo declara éxito con informe completo **y** validación vigente aprobada. Un `END` sin informe exitoso vigente no se presenta como éxito: completa la validación o termina de forma segura.
+- Al agotarse los reintentos, el flujo termina de manera segura (`limited_finish`) con revisión humana pendiente, sin declarar éxito.
+- Los límites existentes se preservan: `ADA_MAX_RETRIES` rondas de reparación y `ADA_MAX_STEPS` pasos globales, impuestos en Python.
 
 ## AgentState y aislamiento de escritura
 
@@ -79,9 +93,9 @@ Añade tu `GROQ_API_KEY` a `.env`. Nunca hagas commit de `.env`.
 Variables de entorno (ver `.env.example`):
 
 - `GROQ_API_KEY`: clave de Groq (requerida solo para la demo LLM en vivo).
-- `ADA_LLM_PROVIDER`, `ADA_LLM_MODEL`, `ADA_TEMPERATURE`: proveedor y modelo.
+- `ADA_LLM_PROVIDER`, `ADA_LLM_MODEL`, `ADA_TEMPERATURE`: proveedor y modelo (default `openai/gpt-oss-20b`; los modelos `llama-3.3-*` ya no están disponibles en Groq).
 - `ADA_MAX_STEPS`: límite global de pasos (default 8).
-- `ADA_MAX_RETRIES`: máximo de rondas de reparación (default 2).
+- `ADA_MAX_RETRIES`: máximo de rondas de reparación tras el primer intento (default 2). Con `2`, una decisión puede repararse hasta dos veces antes de terminar de forma segura.
 - `ADA_TOP_K`: evidencias a recuperar (default 5).
 - `ADA_EMBEDDING_MODEL`: modelo de embeddings local.
 
@@ -94,27 +108,71 @@ uv run pytest
 # Lint
 uv run ruff check .
 
-# CLI de demostración (requiere GROQ_API_KEY)
+# Consola interactiva (requiere GROQ_API_KEY)
 uv run python -m ada
-uv run python -m ada --request "Decidir arquitectura para una API .NET"
+
+# Modo one-shot: una consulta y sale (útil para scripts y demos grabadas)
+uv run python -m ada "Decidir si una API .NET debe ser monolito modular o microservicios"
+uv run python -m ada --request "..." --verbose
 ```
+
+### Consola interactiva y eventos en vivo
+
+Al ejecutar `uv run python -m ada` se abre una sesión interactiva:
+
+- Escribe una consulta de decisión de arquitectura y presiona Enter.
+- El grafo se ejecuta en vivo: cada nodo (Supervisor, Researcher, Analyst, Validator, Synthesizer) imprime una línea conforme se ejecuta, usando el streaming real de LangGraph (`astream(..., stream_mode="updates")`). No hay pasos simulados.
+- Salir con `quit`, `exit` o EOF (Ctrl+D / Ctrl+Z). `help` muestra la ayuda. Las entradas vacías se vuelven a pedir sin ejecutar el grafo.
+- `--verbose` muestra detalles adicionales por nodo (filtra claves, tokens e historial de mensajes; nunca vuelca el estado completo). Se aplica a cada consulta, tanto en modo one-shot como en la sesión interactiva.
+
+Eventos que aparecen en vivo (solo si el nodo los emite):
+
+- **Supervisor**: el agente elegido y el motivo (`Enruta a: Researcher — <motivo>`).
+- **Researcher**: cantidad de evidencias recuperadas.
+- **Analyst**: ranking parcial de alternativas.
+- **Validator**: resultado de validación, errores bloqueantes, avisos, número de intento y revisión humana pendiente.
+- **Synthesizer**: estado del informe generado.
+- **Finalización segura**: el flujo terminó sin recomendación definitiva.
+
+Al terminar, un `RESUMEN FINAL` separado muestra el estado real (completado / requiere revisión humana / finalización segura), la recomendación, alternativas comparadas, puntajes, fuentes trazables y errores pendientes. Un informe inválido nunca se presenta como exitoso.
 
 ## Ejemplo de ejecución e interpretación de la traza
 
 ```
-Nodos recorridos: ['researcher', 'analyst', 'validator', 'synthesizer']
-Fuentes recuperadas (5):
-  - [doc-modular-monolith-01] Modular Monolith: a primer
-    Fuente: https://www.kamilgrzybek.com/design/modular-monolith-primer/
+--- Ejecutando el grafo (eventos en vivo) ---
+[Supervisor]
+  Enruta a: Researcher — No research artifact exists; need evidence...
+[Researcher]
+  Evidencias recuperadas: 5
+[Supervisor]
+  Enruta a: Analyst — Research evidence is available...
+[Analyst]
+  Ranking: microservices > modular-monolith > monolith
+[Supervisor]
+  Enruta a: Validator — Research and analysis artifacts are ready...
+[Validator]
+  Validación: aprobada
+[Synthesizer]
+  Informe generado (estado: complete)
+
+============================================================
+RESUMEN FINAL
+============================================================
+Resultado: decisión completada.
+Estado del informe: complete
+Recomendación: Recomendación: 'Microservicios' (puntaje ponderado 0.940).
+Alternativas comparadas: Monolito, Monolito modular, Microservicios
+
 Puntuaciones ponderadas:
-  - Monolito: 0.640
-  - Monolito modular: 0.710
-  - Microservicios: 0.560
-  Ranking: modular-monolith > monolith > microservices
-Validación: aprobada
-=== INFORME FINAL ===
-Estado: complete
-Recomendación: Recomendación: 'Monolito modular' (puntaje ponderado 0.710).
+  - Monolito: 0.940
+  - Monolito modular: 0.940
+  - Microservicios: 0.940
+  Ranking: microservices > modular-monolith > monolith
+
+Fuentes (5):
+  - [doc-microservices-tradeoffs] Monolith first
+    Origen: https://martinfowler.com/bliki/MonolithFirst.html
+  ...
 ```
 
 Interpretación de la traza (`contributions`): cada registro incluye `agent`, `artifact_type`, `summary`, `step`, `decision`, `reason`, `attempt` y `errors`. Un `attempt > 0` indica una ronda de reparación tras validación; los `errors` listados son los errores concretos que el especialista corrigió.
@@ -132,6 +190,8 @@ Interpretación de la traza (`contributions`): cada registro incluye `agent`, `a
 - La evidencia disponible está definida por el corpus local versionado en `data/corpus/`.
 - El scoring por defecto es una línea base determinística basada en señales de palabras clave; no reemplaza el juicio experto.
 - No hay interfaz web, base de datos externa ni infraestructura cloud: solo Groq para las llamadas LLM de la demo.
+- El streaming muestra los campos útiles descritos arriba; los eventos dependen de lo que cada nodo emita en su actualización. No se muestran datos que no estén disponibles realmente.
+- La integración real con el proveedor (Groq) se probó manualmente con una clave configurada; la suite automatizada funciona con fakes/mocks y no requiere clave.
 
 ## Principios de diseño
 

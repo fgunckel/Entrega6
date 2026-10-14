@@ -33,6 +33,9 @@ class AgentState(MessagesState):
     user_request: str
     system_profile: dict
     criteria: list[dict]
+    # Especificación estructurada de la decisión (decision.py). La fija la
+    # CLI al construir el estado; los nodos la leen, nunca la inventan.
+    decision_spec: NotRequired[dict | None]
 
     research_artifact: NotRequired[dict | None]
     analysis_artifact: NotRequired[dict | None]

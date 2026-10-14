@@ -608,15 +608,28 @@ def test_supervisor_cannot_route_to_synthesizer_without_approved_validation():
 def test_supervisor_end_without_successful_report_is_not_success():
     from ada.graph import route_after_supervisor
 
-    # END with a complete report -> normal finish.
+    # END with a complete report AND a current approved validation -> finish.
     assert (
         route_after_supervisor(
             {
                 "next_agent": "END",
                 "final_report": {"status": "complete"},
+                "validation_result": {"is_valid": True},
             }
         )
         == END
+    )
+    # END with a complete report but NO current validation -> revalidate
+    # (a stale report must not present success).
+    assert (
+        route_after_supervisor(
+            {
+                "next_agent": "END",
+                "final_report": {"status": "complete"},
+                "research_artifact": {"evidence": []},
+            }
+        )
+        == "validator"
     )
     # END without any report or artifacts -> safe stop, no fake success.
     assert (
@@ -691,3 +704,395 @@ def test_stale_validation_does_not_authorize_synthesis(documents):
     # If synthesis happened, the validation must be current and approved.
     if result["final_report"]["status"] == "complete":
         assert result["validation_result"]["is_valid"] is True
+
+
+# ---------------------------------------------------------------------------
+# 15. Robustez A4: invalidación de informe obsoleto y revalidación
+#     post-reparación.
+# ---------------------------------------------------------------------------
+
+
+def _state_with_approved_results() -> dict:
+    """State simulating a previously approved validation and report."""
+    criteria = [Criterion.model_validate(item) for item in [
+        {"criterion_id": "c1", "name": "C1", "weight": 1.0, "description": "d"}
+    ]]
+    return {
+        "user_request": "test",
+        "system_profile": {},
+        "criteria": [criterion.model_dump() for criterion in criteria],
+        "retries": 0,
+        "steps": 3,
+        "validation_errors": ["Weighted score mismatch for 'a'."],
+        "validation_result": {"is_valid": True},  # validación previa aprobada
+        "final_report": {"status": "complete"},  # informe previo exitoso
+        "contributions": [],
+    }
+
+
+def test_researcher_update_invalidates_validation_and_report(documents):
+    from ada.graph import make_researcher_node
+
+    update = make_researcher_node(encoder=fake_encoder, documents=documents)(
+        _state_with_approved_results()
+    )
+
+    # Both the previous validation and the previous report are invalidated.
+    assert update["validation_result"] is None
+    assert update["final_report"] is None
+
+
+def test_analyst_update_invalidates_validation_and_report():
+    from ada.graph import analyst_node
+
+    update = analyst_node(_state_with_approved_results())
+
+    # Both the previous validation and the previous report are invalidated.
+    assert update["validation_result"] is None
+    assert update["final_report"] is None
+
+
+def test_validator_revalidates_new_version_after_repair(documents):
+    from ada.graph import validator_node
+
+    # A repaired analysis (coherent scores, known evidence IDs) must pass a
+    # fresh validation of the NEW version, not inherit the old approval.
+    criteria = [Criterion.model_validate(item) for item in [
+        {"criterion_id": "c1", "name": "C1", "weight": 1.0, "description": "d"}
+    ]]
+    state = {
+        "user_request": "test",
+        "criteria": [criterion.model_dump() for criterion in criteria],
+        "retries": 1,
+        "steps": 5,
+        "research_artifact": {
+            "query": "q",
+            "evidence": [
+                {
+                    "document_id": "doc-1",
+                    "chunk_id": "doc-1#full",
+                    "title": "T",
+                    "excerpt": "E",
+                    "relevance_score": 0.5,
+                    "retrieval_method": ["bm25"],
+                    "content_hash": "abc123",
+                }
+            ],
+            "covered_topics": [],
+            "evidence_gaps": [],
+            "confidence_score": 0.5,
+        },
+        "analysis_artifact": {
+            "alternatives": [
+                {
+                    "alternative_id": "a",
+                    "name": "A",
+                    "scores": [
+                        {
+                            "criterion_id": "c1",
+                            "weight": 1.0,
+                            "score": 4,
+                            "rationale": "r",
+                            "evidence_ids": ["doc-1"],
+                        }
+                    ],
+                    "weighted_score": 0.8,
+                },
+                {
+                    "alternative_id": "b",
+                    "name": "B",
+                    "scores": [
+                        {
+                            "criterion_id": "c1",
+                            "weight": 1.0,
+                            "score": 3,
+                            "rationale": "r",
+                            "evidence_ids": ["doc-1"],
+                        }
+                    ],
+                    "weighted_score": 0.6,
+                },
+            ],
+            "ranking": ["a", "b"],
+            "data_gaps": [],
+            "qualitative_summary": "s",
+        },
+    }
+
+    result = validator_node(state)
+    validation = result["validation_result"]
+
+    # The new version is validated on its own merits: fresh approval.
+    assert validation["is_valid"] is True
+    assert validation["errors"] == []
+    # The repair round is recorded in the audit trail.
+    assert result["contributions"][-1]["attempt"] == 1
+
+
+def test_repaired_flow_reaches_synthesizer_with_current_validation(documents):
+    graph = compile_graph(FakeChatModel(), encoder=fake_encoder, documents=documents)
+
+    # Start with a pending analysis error: the graph must route to the
+    # analyst, revalidate the new version, and only then synthesize.
+    state = initial_state()
+    state["validation_errors"] = ["Weighted score mismatch for 'a'."]
+    result = graph.invoke(state)
+
+    visited = [c["agent"] for c in result.get("contributions", [])]
+    assert "analyst" in visited
+    assert "validator" in visited
+    # Synthesis only with a current approved validation of the new version.
+    if "synthesizer" in visited:
+        assert result["validation_result"]["is_valid"] is True
+        assert result["final_report"]["status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# 8. Semántica de ADA_MAX_RETRIES: reparaciones, no validaciones totales
+#
+# Pruebas deterministas sobre validator_node y route_after_validator con
+# estados controlados: sin depender del ciclo fake a nivel de grafo.
+# ---------------------------------------------------------------------------
+
+
+class SettingsWithRetries:
+    """Proxy de Settings que solo sobrescribe max_retries."""
+
+    def __init__(self, max_retries: int):
+        self._max_retries = max_retries
+
+    def __getattr__(self, name):
+        from ada.config import get_settings as real_get_settings
+
+        return getattr(real_get_settings(), name)
+
+    @property
+    def max_retries(self):
+        return self._max_retries
+
+
+def make_repair_state(retries: int = 0) -> dict:
+    """Estado con un error de análisis fixable: el `weighted_score`
+    reportado no coincide con el calculado por Python (0.8)."""
+    return {
+        "user_request": "test",
+        "criteria": [],
+        "retries": retries,
+        "steps": 5,
+        "research_artifact": {
+            "query": "q",
+            "evidence": [
+                {
+                    "document_id": "doc-1",
+                    "chunk_id": "doc-1#full",
+                    "title": "T",
+                    "excerpt": "Un monolito modular organiza el código en módulos.",
+                    "relevance_score": 0.9,
+                    "retrieval_method": ["bm25"],
+                    "content_hash": "abc123",
+                }
+            ],
+            "covered_topics": [],
+            "evidence_gaps": [],
+            "confidence_score": 0.5,
+        },
+        "analysis_artifact": {
+            "alternatives": [
+                {
+                    "alternative_id": "monolith",
+                    "name": "Monolito",
+                    "scores": [
+                        {
+                            "criterion_id": "dev-speed",
+                            "weight": 0.25,
+                            "score": 4,
+                            "rationale": "r",
+                            "evidence_ids": ["doc-1"],
+                        },
+                        {
+                            "criterion_id": "operational-cost",
+                            "weight": 0.25,
+                            "score": 4,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "independent-deploys",
+                            "weight": 0.15,
+                            "score": 3,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "scalability",
+                            "weight": 0.15,
+                            "score": 3,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "team-alignment",
+                            "weight": 0.20,
+                            "score": 4,
+                            "rationale": "r",
+                        },
+                    ],
+                    # Incorrecto a propósito: el calculado es 0.8.
+                    "weighted_score": 0.5,
+                },
+                {
+                    "alternative_id": "microservices",
+                    "name": "Microservicios",
+                    "scores": [
+                        {
+                            "criterion_id": "dev-speed",
+                            "weight": 0.25,
+                            "score": 3,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "operational-cost",
+                            "weight": 0.25,
+                            "score": 3,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "independent-deploys",
+                            "weight": 0.15,
+                            "score": 4,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "scalability",
+                            "weight": 0.15,
+                            "score": 4,
+                            "rationale": "r",
+                        },
+                        {
+                            "criterion_id": "team-alignment",
+                            "weight": 0.20,
+                            "score": 3,
+                            "rationale": "r",
+                        },
+                    ],
+                    "weighted_score": 0.6,
+                },
+            ],
+            "ranking": ["monolith", "microservices"],
+            "data_gaps": [],
+            "qualitative_summary": "s",
+        },
+    }
+
+
+def test_max_retries_0_first_failure_is_not_repairable(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(0))
+
+    result = validator_node(make_repair_state(retries=0))
+
+    # First failure with max_retries=0: no repair dispatched.
+    validation = result["validation_result"]
+    assert validation["is_valid"] is False
+    assert "pending_repair_agent" not in validation
+    assert result["retries"] == 0
+    assert route_after_validator(result) == "limited_finish"
+
+
+def test_max_retries_1_first_failure_dispatches_one_repair(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(1))
+
+    result = validator_node(make_repair_state(retries=0))
+
+    # First failure (retries=0 < 1): one repair dispatched, counter 0 -> 1.
+    validation = result["validation_result"]
+    assert validation["is_valid"] is False
+    assert validation["pending_repair_agent"] == "analyst"
+    assert result["retries"] == 1
+    assert result["validation_errors"]  # specific errors for the analyst
+    assert route_after_validator(result) == "analyst"
+
+
+def test_max_retries_1_second_failure_ends_safely(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(1))
+
+    # Second failure (retries=1 >= max_retries): no second repair.
+    result = validator_node(make_repair_state(retries=1))
+    validation = result["validation_result"]
+    assert validation["is_valid"] is False
+    assert "pending_repair_agent" not in validation
+    # Sin reparación despachada, el contador no cambia (el update no lo
+    # incluye: LangGraph conserva el valor previo).
+    assert result.get("retries", 1) == 1
+    assert route_after_validator(result) == "limited_finish"
+
+
+def test_max_retries_2_allows_two_repairs_and_blocks_third(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(2))
+
+    # First failure (retries=0): repair 1 dispatched.
+    first = validator_node(make_repair_state(retries=0))
+    assert first["retries"] == 1
+    assert route_after_validator(first) == "analyst"
+
+    # Second failure (retries=1): repair 2 dispatched.
+    second = validator_node(make_repair_state(retries=1))
+    assert second["retries"] == 2
+    assert route_after_validator(second) == "analyst"
+
+    # Third failure (retries=2): budget exhausted, safe finish.
+    third = validator_node(make_repair_state(retries=2))
+    assert third.get("retries", 2) == 2  # no increment
+    assert "pending_repair_agent" not in third["validation_result"]
+    assert route_after_validator(third) == "limited_finish"
+
+
+def test_counter_increments_exactly_once_per_repair(monkeypatch):
+    from ada.graph import validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(3))
+
+    # Each dispatched repair increments the counter exactly once.
+    retries = 0
+    for expected in (1, 2, 3):
+        result = validator_node(make_repair_state(retries=retries))
+        assert result["retries"] == expected
+        retries = expected
+
+
+def test_repair_budget_exhausted_requires_human_review(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(2))
+
+    # Exhausted repair budget with a still-failing artifact: human review
+    # pending, never presented as success.
+    result = validator_node(make_repair_state(retries=2))
+    validation = result["validation_result"]
+    assert validation["is_valid"] is False
+    assert validation["requires_human_review"] is True
+    assert route_after_validator(result) == "limited_finish"
+
+
+def test_missing_analysis_artifact_is_classified_and_repairable(monkeypatch):
+    from ada.graph import route_after_validator, validator_node
+
+    monkeypatch.setattr("ada.graph.get_settings", lambda: SettingsWithRetries(2))
+
+    # Missing analysis artifact: the error IS classifiable (analyst's
+    # artifact), so a repair is dispatched with budget available.
+    state = make_repair_state(retries=0)
+    state["analysis_artifact"] = None
+    result = validator_node(state)
+
+    validation = result["validation_result"]
+    assert validation["is_valid"] is False
+    assert validation["analysis_errors"]
+    assert validation["pending_repair_agent"] == "analyst"
+    assert route_after_validator(result) == "analyst"
+
+

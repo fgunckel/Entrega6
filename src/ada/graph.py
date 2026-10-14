@@ -25,7 +25,7 @@ from ada.schemas import (
     RoutingDecision,
     ValidationResult,
 )
-from ada.state import AgentState
+from ada.state import AgentName, AgentState
 from ada.tools.scoring import calculate_weighted_score
 
 Worker = Callable[[dict], dict]
@@ -77,9 +77,11 @@ def make_researcher_node(encoder=None, documents=None) -> Worker:
         return {
             "research_artifact": artifact.model_dump(),
             "validation_errors": [],
-            # Invalidación de validación previa: el artefacto cambió, así que
-            # una validación anterior aprobada ya no autoriza la síntesis.
+            # Invalidación de resultados previos: el artefacto cambió, así que
+            # una validación o informe anterior ya no autoriza la síntesis ni
+            # un END exitoso.
             "validation_result": None,
+            "final_report": None,
             "contributions": [
                 *state.get("contributions", []),
                 {
@@ -122,9 +124,19 @@ def analyst_node(state: dict) -> dict:
     if not criteria:
         criteria = _default_criteria()
 
-    alternatives = state.get("system_profile", {}).get("alternatives")
-    if not alternatives:
-        alternatives = _default_alternatives()
+    # Alineación consulta-alternativas: si la consulta solicitó alternativas
+    # explícitas (DecisionSpec), se evalúan esas, nunca la lista genérica.
+    decision_spec = state.get("decision_spec") or {}
+    requested = decision_spec.get("requested_alternatives") or []
+    if decision_spec.get("alternatives_are_explicit") and requested:
+        alternatives = [
+            {"alternative_id": item["alternative_id"], "name": item["name"]}
+            for item in requested
+        ]
+    else:
+        alternatives = state.get("system_profile", {}).get("alternatives")
+        if not alternatives:
+            alternatives = _default_alternatives()
 
     research = state.get("research_artifact") or {}
     proposed = derive_scores_from_evidence(
@@ -144,9 +156,11 @@ def analyst_node(state: dict) -> dict:
     return {
         "analysis_artifact": artifact.model_dump(),
         "validation_errors": [],
-        # Invalidación de validación previa: el artefacto cambió, así que
-        # una validación anterior aprobada ya no autoriza la síntesis.
+        # Invalidación de resultados previos: el artefacto cambió, así que
+        # una validación o informe anterior ya no autoriza la síntesis ni
+        # un END exitoso.
         "validation_result": None,
+        "final_report": None,
         "contributions": [
             *state.get("contributions", []),
             {
@@ -161,6 +175,21 @@ def analyst_node(state: dict) -> dict:
     }
 
 
+def _is_relevant_evidence(
+    evidence,
+    question_signals: list[str],
+    alternative_signals: list[str],
+) -> bool:
+    """Decidir si una evidencia se relaciona con la decisión solicitada.
+
+    Es pertinente si su texto contiene alguna señal de las alternativas
+    solicitadas (las señales de la pregunta quedaron en desuso: la
+    pertinencia se evalúa contra las alternativas explícitas).
+    """
+    text = f"{evidence.title} {evidence.excerpt}".lower()
+    return any(signal in text for signal in alternative_signals)
+
+
 def validator_node(state: dict) -> dict:
     """Deterministic validator node. Owns only `validation_result`.
 
@@ -172,6 +201,8 @@ def validator_node(state: dict) -> dict:
     warnings: list[str] = []
     research_errors: list[str] = []
     analysis_errors: list[str] = []
+    unsupported: list[str] = []
+    decision_spec = state.get("decision_spec") or {}
 
     research = state.get("research_artifact")
     analysis = state.get("analysis_artifact")
@@ -252,6 +283,99 @@ def validator_node(state: dict) -> dict:
                 warnings.append(
                     "Analysis relies on assumptions: no evidence was retrieved."
                 )
+                # Sin evidencia, todos los criterios evaluados carecen de
+                # soporte trazable en el corpus.
+                unsupported = sorted(
+                    {
+                        score.criterion_id
+                        for alternative in analysis_artifact.alternatives
+                        for score in alternative.scores
+                    }
+                )
+
+            # Pertinencia semántica: los artefactos deben responder a la
+            # decisión solicitada, no solo cumplir sus esquemas.
+            if decision_spec.get("alternatives_are_explicit"):
+                requested_ids = {
+                    item["alternative_id"]
+                    for item in decision_spec.get("requested_alternatives", [])
+                }
+                analysis_ids = {
+                    alternative.alternative_id
+                    for alternative in analysis_artifact.alternatives
+                }
+                unexpected = sorted(analysis_ids - requested_ids)
+                if unexpected:
+                    error = (
+                        "Analysis evaluates alternatives not requested by the "
+                        f"query: {', '.join(unexpected)}. Requested: "
+                        f"{', '.join(sorted(requested_ids))}."
+                    )
+                    errors.append(error)
+                    analysis_errors.append(error)
+
+                missing_requested = sorted(requested_ids - analysis_ids)
+                if missing_requested:
+                    error = (
+                        "Analysis omits alternatives requested by the query: "
+                        f"{', '.join(missing_requested)}."
+                    )
+                    errors.append(error)
+                    analysis_errors.append(error)
+
+            # Criterios solicitados no evaluados: discrepancia accionable.
+            requested_criteria = set(decision_spec.get("requested_criteria", []))
+            evaluated_criteria = {
+                score.criterion_id
+                for alternative in analysis_artifact.alternatives
+                for score in alternative.scores
+            }
+            unevaluated = sorted(requested_criteria - evaluated_criteria)
+            if unevaluated:
+                error = (
+                    "Analysis omits criteria requested by the query: "
+                    f"{', '.join(unevaluated)}."
+                )
+                errors.append(error)
+                analysis_errors.append(error)
+
+            # Evidencia pertinente: cuando la consulta solicitó alternativas
+            # explícitas, la evidencia debe mencionar al menos una de ellas;
+            # si no, la comparación se apoyaría en contexto irrelevante.
+            if research_artifact.evidence and decision_spec.get(
+                "alternatives_are_explicit"
+            ):
+                alternative_signals = [
+                    signal
+                    for item in decision_spec.get("requested_alternatives", [])
+                    for signal in item.get("signals", [])
+                ]
+                relevant = [
+                    item
+                    for item in research_artifact.evidence
+                    if _is_relevant_evidence(item, [], alternative_signals)
+                ]
+                if not relevant:
+                    error = (
+                        "No retrieved evidence mentions any requested "
+                        "alternative; the comparison would rely on irrelevant "
+                        "context."
+                    )
+                    errors.append(error)
+                    research_errors.append(error)
+                    unsupported = sorted(
+                        {
+                            score.criterion_id
+                            for alternative in analysis_artifact.alternatives
+                            for score in alternative.scores
+                            if score.is_assumption
+                        }
+                    )
+                elif len(relevant) < len(research_artifact.evidence):
+                    warnings.append(
+                        "Some retrieved evidence is contextual only: it does "
+                        "not mention the requested alternatives."
+                    )
 
     is_valid = not errors
     settings = get_settings()
@@ -272,10 +396,14 @@ def validator_node(state: dict) -> dict:
         ),
         research_errors=research_errors,
         analysis_errors=analysis_errors,
+        unsupported_criteria=unsupported,
     )
 
     update: dict = {
         "validation_result": result.model_dump(),
+        # El contador siempre viaja con el update: el enrutador y los nodos
+        # posteriores nunca deben inferir un presupuesto ya consumido.
+        "retries": retries,
         "contributions": [
             *state.get("contributions", []),
             {
@@ -352,16 +480,36 @@ def synthesizer_node(state: dict) -> dict:
         {},
     )
 
-    summary = (
-        f"Decisión sobre: {state.get('user_request', '')}. "
-        f"Se evaluaron {len(alternatives_considered)} alternativas con criterios ponderados; "
-        f"evidencia recuperada del corpus local ({len(evidence_ids)} fuentes)."
-    )
-
-    recommendation = (
-        f"Recomendación: '{best.get('name', best_id)}' "
-        f"(puntaje ponderado {best.get('weighted_score', 0):.3f})."
-    )
+    # Empates honestos: si el top comparte puntaje, la recomendación lo dice.
+    tied = [
+        a.get("name", a.get("alternative_id", ""))
+        for a in analysis.get("alternatives", [])
+        if abs(a.get("weighted_score", 0) - best.get("weighted_score", 0)) <= 1e-6
+    ]
+    if len(tied) > 1:
+        summary = (
+            f"Decisión sobre: {state.get('user_request', '')}. "
+            f"Se evaluaron {len(alternatives_considered)} alternativas con criterios ponderados; "
+            f"evidencia recuperada del corpus local ({len(evidence_ids)} fuentes). "
+            f"Resultado: EMPATE entre {', '.join(tied)} con puntaje "
+            f"{best.get('weighted_score', 0):.6f}; el corpus no permite "
+            f"diferenciarlas."
+        )
+        recommendation = (
+            f"Empate entre {', '.join(tied)} (puntaje ponderado "
+            f"{best.get('weighted_score', 0):.6f}). No se emite recomendación "
+            f"única: revisar los trade-offs y decidir con criterios adicionales."
+        )
+    else:
+        summary = (
+            f"Decisión sobre: {state.get('user_request', '')}. "
+            f"Se evaluaron {len(alternatives_considered)} alternativas con criterios ponderados; "
+            f"evidencia recuperada del corpus local ({len(evidence_ids)} fuentes)."
+        )
+        recommendation = (
+            f"Recomendación: '{best.get('name', best_id)}' "
+            f"(puntaje ponderado {best.get('weighted_score', 0):.3f})."
+        )
 
     return {
         "final_report": FinalReport(
@@ -373,6 +521,14 @@ def synthesizer_node(state: dict) -> dict:
             assumptions=analysis.get("data_gaps", []),
             risks_and_limitations=[
                 "La evidencia proviene exclusivamente del corpus local versionado.",
+                *(
+                    [
+                        "Criterios sin soporte directo en el corpus: "
+                        + ", ".join(validation.get("unsupported_criteria", []))
+                    ]
+                    if validation.get("unsupported_criteria")
+                    else []
+                ),
             ],
             validation_warnings=validation.get("warnings", []),
         ).model_dump(),
@@ -388,7 +544,7 @@ def synthesizer_node(state: dict) -> dict:
     }
 
 
-def route_after_supervisor(state: dict) -> str:
+def route_after_supervisor(state: dict) -> AgentName:
     """Conditional edge with deterministic synthesis protection.
 
     The supervisor (LLM) proposes a route, but this edge enforces the
@@ -408,7 +564,10 @@ def route_after_supervisor(state: dict) -> str:
 
     if proposed == "END":
         report = state.get("final_report") or {}
-        if report.get("status") == "complete":
+        if report.get("status") == "complete" and approved:
+            # END exitoso solo con informe completo Y validación vigente
+            # aprobada (los especialistas invalidan ambas al cambiar un
+            # artefacto, así que si ambas están vigentes no hay obsolescencia).
             return END
         # END sin informe exitoso vigente no se presenta como éxito.
         return "validator" if state.get("research_artifact") else "limited_finish"
@@ -416,18 +575,33 @@ def route_after_supervisor(state: dict) -> str:
     return proposed
 
 
-def route_after_validator(state: dict) -> str:
+def route_after_validator(state: dict) -> AgentName:
     """Deterministic conditional edge after the validator.
 
     - All required artifacts valid -> synthesizer.
-    - Fixable errors with retries remaining -> the specialist responsible
+    - Fixable errors with repairs remaining -> the specialist responsible
       for the affected artifact (it receives the specific errors in state).
-    - Retries exhausted or unclassified errors -> limited_finish (safe
+    - Repairs exhausted or unclassified errors -> limited_finish (safe
       output; human review pending). Never synthesizes an invalid result.
+
+    Semantics of `retries`: number of repairs already dispatched. The
+    validator increments it exactly once per dispatched repair, so this
+    router compares the value as-is: a repair is allowed while
+    `retries < max_retries`. With `ADA_MAX_RETRIES=2` the first failure
+    (retries=0) and the second failure (retries=1) are both repairable;
+    a third failure (retries=2) ends safely.
     """
     validation = state.get("validation_result") or {}
     if validation.get("is_valid"):
         return "synthesizer"
+
+    # El validador ya verificó el presupuesto de reparaciones antes de
+    # despachar (incrementa `retries` exactamente una vez por reparación).
+    # Si despachó una, seguirla sin re-verificar el contador ya incrementado:
+    # re-verificarlo aquí bloquearía la última reparación prevista.
+    pending = validation.get("pending_repair_agent")
+    if pending in {"researcher", "analyst"}:
+        return pending
 
     settings = get_settings()
     if state.get("retries", 0) >= settings.max_retries:

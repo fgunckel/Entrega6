@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     groq_api_key: SecretStr | None = None
     llm_provider: Literal["groq"] = Field(default="groq", alias="ADA_LLM_PROVIDER")
-    llm_model: str = Field(default="llama-3.3-70b-versatile", alias="ADA_LLM_MODEL")
+    llm_model: str = Field(default="openai/gpt-oss-20b", alias="ADA_LLM_MODEL")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, alias="ADA_TEMPERATURE")
     max_steps: int = Field(default=8, ge=1, le=30, alias="ADA_MAX_STEPS")
     max_retries: int = Field(default=2, ge=0, le=5, alias="ADA_MAX_RETRIES")

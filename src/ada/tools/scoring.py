@@ -47,7 +47,12 @@ def calculate_weighted_score(
 def rank_alternatives(
     alternatives: list[AlternativeAnalysis],
 ) -> list[str]:
-    """Return alternative IDs ordered by weighted score, highest first."""
+    """Return alternative IDs ordered by weighted score, highest first.
+
+    Tie-break: insertion order (the order in which the alternatives were
+    provided), never an arbitrary alphabetical artifact. Ties are honest:
+    equal scores keep the original relative order.
+    """
     if not alternatives:
         raise ValueError("At least one alternative is required.")
 
@@ -57,11 +62,8 @@ def rank_alternatives(
         raise ValueError("Alternative IDs must be unique.")
 
     ranked = sorted(
-        alternatives,
-        key=lambda alternative: (
-            -alternative.weighted_score,
-            alternative.alternative_id,
-        ),
+        enumerate(alternatives),
+        key=lambda pair: (-pair[1].weighted_score, pair[0]),
     )
 
-    return [alternative.alternative_id for alternative in ranked]
+    return [alternative.alternative_id for _, alternative in ranked]
